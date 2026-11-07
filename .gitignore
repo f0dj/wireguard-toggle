@@ -1,0 +1,4 @@
+AGENTS.md
+.build/
+dist/
+.router-audit/

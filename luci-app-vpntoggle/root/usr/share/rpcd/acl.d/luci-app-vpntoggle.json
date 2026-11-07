@@ -1,0 +1,31 @@
+{
+	"luci-app-vpntoggle": {
+		"description": "Grant access to the VPN toggle controls (runs /usr/sbin/vpn-toggle as root)",
+		"read": {
+			"ubus": {
+				"file": [ "exec" ]
+			},
+			"file": {
+				"/usr/sbin/vpn-toggle status": [ "exec" ],
+				"/usr/sbin/vpn-toggle info": [ "exec" ],
+				"/usr/sbin/vpn-toggle list": [ "exec" ],
+				"/usr/sbin/vpn-toggle latency *": [ "exec" ],
+				"/usr/sbin/vpn-toggle validate *": [ "exec" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"file": [ "exec", "write" ]
+			},
+			"file": {
+				"/usr/sbin/vpn-toggle on": [ "exec" ],
+				"/usr/sbin/vpn-toggle off": [ "exec" ],
+				"/usr/sbin/vpn-toggle switch": [ "exec" ],
+				"/usr/sbin/vpn-toggle pick *": [ "exec" ],
+				"/usr/sbin/vpn-toggle set *": [ "exec" ],
+				"/usr/sbin/vpn-toggle fetch *": [ "exec" ],
+				"/etc/wireguard/profiles/*": [ "write" ]
+			}
+		}
+	}
+}

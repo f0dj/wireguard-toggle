@@ -1,0 +1,17 @@
+#!/bin/sh /etc/rc.common
+# vpntoggle boot failsafe.
+# Cleans any leftover state from a crash while the tunnel was ON, so the
+# router always boots back to clean direct internet (idempotent, safe at boot).
+# This is intentional: a reboot must never leave non-technical users without
+# working internet. The `setup` command (or this package's postinst) enables it.
+
+START=95
+STOP=
+
+start() {
+	[ -x /usr/sbin/vpn-toggle ] && /usr/sbin/vpn-toggle reset
+}
+
+stop() {
+	[ -x /usr/sbin/vpn-toggle ] && /usr/sbin/vpn-toggle reset
+}

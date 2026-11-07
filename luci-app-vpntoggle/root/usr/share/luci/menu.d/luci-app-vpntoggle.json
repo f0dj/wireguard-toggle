@@ -1,0 +1,16 @@
+{
+	"admin/vpn/vpntoggle": {
+		"title": "VPN Toggle",
+		"order": 1,
+		"action": {
+			"type": "view",
+			"path": "vpntoggle/index"
+		},
+		"depends": {
+			"acl": [ "luci-app-vpntoggle" ],
+			"fs": {
+				"/usr/sbin/vpn-toggle": "executable"
+			}
+		}
+	}
+}

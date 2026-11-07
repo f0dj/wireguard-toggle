@@ -1,0 +1,17 @@
+wireguard-toggle
+Copyright (C) 2026 f0dj
+
+This product is licensed under the Apache License, Version 2.0. The full
+license text is in LICENSE at the repository root, and is also shipped with
+each package as vpntoggle/LICENSE and luci-app-vpntoggle/LICENSE.
+
+Apache-2.0 permits private, commercial and closed-source use. It requires
+redistributors to keep this attribution notice and to propagate this NOTICE
+file. Section 6 covers trademarks: it grants no rights to the vpntoggle name.
+The appendix of the license text explains how to apply these terms to your
+own files.
+
+Note on earlier releases: builds through v1.1.0-r2 were distributed under the
+GPL-2.0 terms declared in the package metadata at that time. That grant is
+irrevocable for copies already handed out; this repository and all later
+builds are Apache-2.0.

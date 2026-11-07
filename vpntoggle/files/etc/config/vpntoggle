@@ -1,0 +1,31 @@
+config vpntoggle 'main'
+	# Directory holding WireGuard profile files (*.conf, wg-quick format)
+	option profiles_dir '/etc/wireguard/profiles'
+
+	# netifd interface name and peer section name to use
+	option iface 'wgclient'
+	option peer 'wireguard_wgclient'
+
+	# Policy routing table id and rule priority
+	option table '100'
+	option pref '1000'
+
+	# DNS server advertised by the tunnel (used when a profile has no DNS=)
+	option dns '10.2.0.1'
+
+	# Selection mode: random or pinned (see `vpn-toggle pin <profile>`)
+	option mode 'random'
+	# option pinned 'example.conf'
+
+	# Optional kill switch: while ON, drop LAN traffic that is not going
+	# through the tunnel or staying on the LAN. Off by default.
+	option killswitch '0'
+
+	# Drop IPv6 from LAN clients while ON (the tunnel is IPv4-only, so v6
+	# would otherwise leak out the WAN). On by default.
+	option block_ipv6 '1'
+
+	# LAN subnet (CIDR) and device to route through the tunnel.
+	# Leave empty to auto-detect from uci `network.lan`.
+	option lan_net ''
+	option lan_dev ''

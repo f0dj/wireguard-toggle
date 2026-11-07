@@ -1,0 +1,792 @@
+#!/bin/sh
+# vpn-toggle - random WireGuard profile toggle for OpenWrt (fw4/netifd)
+# Configuration: /etc/config/vpntoggle (uci) overrides; the LAN is
+# auto-detected from uci network.lan, with the defaults below as fallback.
+#
+# Safety model:
+#   * staged bring-up: handshake + data path are proven before LAN routing/DNS
+#     are touched; any failure rolls back with the LAN untouched;
+#   * the router's own LAN address is excluded from the tunnel;
+#   * optional kill switch drops LAN traffic that would leak out a non-tunnel
+#     interface while ON;
+#   * IPv6 from LAN clients is dropped while ON (unless disabled), because the
+#     tunnel is IPv4-only and v6 would otherwise leak;
+#   * the boot init script runs `reset`, so a reboot always returns to a clean
+#     direct-internet state (failsafe for non-technical users).
+
+# --- built-in defaults ---
+DEF_PROFILES_DIR=/etc/wireguard/profiles
+DEF_IFACE=wgclient
+DEF_PEER=wireguard_wgclient
+DEF_TABLE=100
+DEF_PREF=1000
+DEF_LAN_NET=192.168.1.0/24
+DEF_LAN_DEV=br-lan
+DEF_DNS=10.2.0.1
+DEF_MODE=random
+DEF_KILLSWITCH=0
+DEF_BLOCK_IPV6=1
+
+PROFILES_DIR=$DEF_PROFILES_DIR
+IFACE=$DEF_IFACE
+PEER=$DEF_PEER
+TABLE=$DEF_TABLE
+PREF=$DEF_PREF
+LAN_NET=$DEF_LAN_NET
+LAN_DEV=$DEF_LAN_DEV
+DNS_DEFAULT=$DEF_DNS
+MODE=$DEF_MODE
+PINNED=
+KILLSWITCH=$DEF_KILLSWITCH
+BLOCK_IPV6=$DEF_BLOCK_IPV6
+
+# --- runtime state (root-only, on tmpfs) and persistent state ---
+STATE_DIR=/var/run/vpntoggle
+PERSIST_DIR=/etc/vpntoggle/state
+ACTIVE_FILE=$STATE_DIR/active
+DNS_MARKER=$STATE_DIR/dns
+DNS_BAK=$PERSIST_DIR/dns.bak
+LOCK_DIR=$STATE_DIR/lock
+NFT_TABLE=vpntoggle
+
+err() { echo "ERROR: $*" >&2; }
+
+ip2n() {  # dotted quad -> integer
+    local r=$1 o n
+    o=${r%%.*}; n=$((o << 24)); r=${r#*.}
+    o=${r%%.*}; n=$((n + (o << 16))); r=${r#*.}
+    o=${r%%.*}; n=$((n + (o << 8))); r=${r#*.}
+    echo $((n + r))
+}
+n2ip() {  # integer -> dotted quad
+    echo "$(( ($1 >> 24) & 255 )).$(( ($1 >> 16) & 255 )).$(( ($1 >> 8) & 255 )).$(( $1 & 255 ))"
+}
+maskbits() {  # netmask integer -> prefix length
+    local m=$1 c=0
+    while [ "$m" -gt 0 ]; do
+        c=$((c + (m & 1)))
+        m=$((m >> 1))
+    done
+    echo "$c"
+}
+detect_lan() {  # fill LAN_NET/LAN_DEV from uci network.lan when possible
+    local lip lmask ldev ni nm
+    lip=$(uci -q get network.lan.ipaddr) || return 1
+    lmask=$(uci -q get network.lan.netmask) || return 1
+    ldev=$(uci -q get network.lan.device) || return 1
+    [ -n "$lip" ] && [ -n "$lmask" ] && [ -n "$ldev" ] || return 1
+    ni=$(ip2n "$lip"); nm=$(ip2n "$lmask")
+    LAN_DEV=$ldev
+    LAN_NET="$(n2ip $((ni & nm)))/$(maskbits "$nm")"
+}
+
+# --- /etc/config/vpntoggle overrides (uci) ---
+_cfg_has_lan=0
+if [ -f /etc/config/vpntoggle ]; then
+    cfg_get() { uci -q get "vpntoggle.main.$1" 2>/dev/null; }
+    _v=$(cfg_get profiles_dir); [ -n "$_v" ] && PROFILES_DIR=$_v
+    _v=$(cfg_get iface);        [ -n "$_v" ] && IFACE=$_v
+    _v=$(cfg_get peer);         [ -n "$_v" ] && PEER=$_v
+    _v=$(cfg_get table);        [ -n "$_v" ] && TABLE=$_v
+    _v=$(cfg_get pref);         [ -n "$_v" ] && PREF=$_v
+    _v=$(cfg_get dns);          [ -n "$_v" ] && DNS_DEFAULT=$_v
+    _v=$(cfg_get mode);         [ -n "$_v" ] && MODE=$_v
+    _v=$(cfg_get pinned);       [ -n "$_v" ] && PINNED=$_v
+    _v=$(cfg_get killswitch);   [ -n "$_v" ] && KILLSWITCH=$_v
+    _v=$(cfg_get block_ipv6);   [ -n "$_v" ] && BLOCK_IPV6=$_v
+    _v=$(cfg_get lan_net);      [ -n "$_v" ] && { LAN_NET=$_v; _cfg_has_lan=1; }
+    _v=$(cfg_get lan_dev);      [ -n "$_v" ] && { LAN_DEV=$_v; _cfg_has_lan=1; }
+    unset _v
+fi
+
+# --- auto-detect LAN from uci network.lan (only when not pinned above) ---
+if [ "$_cfg_has_lan" = 0 ]; then
+    detect_lan 2>/dev/null
+fi
+unset _cfg_has_lan
+[ "$MODE" = pinned ] || MODE=random
+case "$KILLSWITCH" in 1) ;; *) KILLSWITCH=0 ;; esac
+case "$BLOCK_IPV6" in 0) ;; *) BLOCK_IPV6=1 ;; esac
+
+# --- locking ---------------------------------------------------------------
+release_lock() { rmdir "$LOCK_DIR" 2>/dev/null; }
+acquire_lock() {
+    mkdir -p "$STATE_DIR" 2>/dev/null
+    chmod 700 "$STATE_DIR" 2>/dev/null
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        echo $$ > "$LOCK_DIR/pid" 2>/dev/null
+        trap 'release_lock' EXIT INT TERM
+        return 0
+    fi
+    oldpid=$(cat "$LOCK_DIR/pid" 2>/dev/null)
+    if [ -n "$oldpid" ] && ! kill -0 "$oldpid" 2>/dev/null; then
+        rm -rf "$LOCK_DIR" 2>/dev/null
+        if mkdir "$LOCK_DIR" 2>/dev/null; then
+            echo $$ > "$LOCK_DIR/pid" 2>/dev/null
+            trap 'release_lock' EXIT INT TERM
+            return 0
+        fi
+    fi
+    err "another vpn-toggle operation is in progress"
+    exit 1
+}
+
+# --- profile helpers -------------------------------------------------------
+sanitize_name() {  # -> safe bare profile name (no .conf)
+    local n
+    n=$(printf '%s' "${1:-}" | tr -d '\r\n')
+    n=${n%.conf}
+    n=$(printf '%s' "$n" | sed 's#[^A-Za-z0-9._-]#_#g; s#^\.*##')
+    printf '%s' "$n" | cut -c1-64
+}
+
+pick_profile() {  # optional $1: basename to exclude from the pool; echoes chosen path
+    local excl="${1:-}" file i n=0 any=0 r
+    for file in "$PROFILES_DIR"/*.conf; do
+        [ -e "$file" ] || continue
+        any=1
+        if [ -n "$excl" ] && [ "${file##*/}" = "$excl" ]; then
+            continue
+        fi
+        # never select a profile that does not parse
+        ( parse_profile "$file" >/dev/null 2>&1 ) || continue
+        n=$((n+1))
+    done
+    if [ "$any" -eq 0 ]; then
+        err "no *.conf in $PROFILES_DIR"
+        exit 1
+    fi
+    if [ "$n" -eq 0 ]; then
+        if [ -n "$excl" ] && [ "$any" -eq 1 ]; then
+            err "cannot pick: only profile available is $excl"
+        else
+            err "no valid *.conf in $PROFILES_DIR"
+        fi
+        exit 1
+    fi
+    r=$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' \t\n')
+    [ -n "$r" ] || r=$$
+    r=$(( (r % n) + 1 ))
+    i=0
+    for file in "$PROFILES_DIR"/*.conf; do
+        [ -e "$file" ] || continue
+        if [ -n "$excl" ] && [ "${file##*/}" = "$excl" ]; then
+            continue
+        fi
+        ( parse_profile "$file" >/dev/null 2>&1 ) || continue
+        i=$((i+1))
+        if [ "$i" -eq "$r" ]; then
+            echo "$file"
+            return 0
+        fi
+    done
+    exit 1
+}
+
+resolve_profile() {  # $1 = bare profile name or a path inside PROFILES_DIR
+    local name="${1:-}" cand real pdir
+    [ -n "$name" ] || { err "no profile name given"; return 1; }
+    case "$name" in
+        */*)
+            real=$(readlink -f "$name" 2>/dev/null) || { err "profile not found: $name"; return 1; }
+            pdir=$(readlink -f "$PROFILES_DIR" 2>/dev/null) || return 1
+            case "$real" in
+                "$pdir"/*) ;;
+                *) err "profile outside $PROFILES_DIR: $name"; return 1 ;;
+            esac
+            [ -f "$real" ] || { err "profile not found: $name"; return 1; }
+            echo "$real"
+            return 0 ;;
+    esac
+    case "$name" in
+        *[!A-Za-z0-9._-]*) err "invalid profile name: $name"; return 1 ;;
+        .*|*..*) err "invalid profile name: $name"; return 1 ;;
+    esac
+    case "$name" in
+        *.conf) ;;
+        *) name=$name.conf ;;
+    esac
+    cand="$PROFILES_DIR/$name"
+    if [ -f "$cand" ]; then
+        echo "$cand"
+        return 0
+    fi
+    err "profile not found in $PROFILES_DIR: $name"
+    return 1
+}
+
+parse_profile() {  # $1=file -> sets PK ADDR DNSVAL PUB PSK EP KEEP ALLOWED
+    PK=; ADDR=; DNSVAL=; PUB=; PSK=; EP=; KEEP=; ALLOWED=
+    sec=
+    while IFS= read -r line; do
+        line=$(printf '%s' "$line" | tr -d '\r')
+        case "$line" in
+            \#*|'') continue ;;
+            '['*']')
+                case "$line" in
+                    '[Interface]') sec=iface ;;
+                    '[Peer]') sec=peer ;;
+                    *) sec= ;;
+                esac
+                continue ;;
+        esac
+        [ -n "$sec" ] || continue
+        key=${line%%=*}; val=${line#*=}
+        key=$(printf '%s' "$key" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        val=$(printf '%s' "$val" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        [ -n "$key" ] || continue
+        case "$sec:$key" in
+            iface:PrivateKey) PK=$val ;;
+            iface:Address) ADDR=$val ;;
+            iface:DNS) DNSVAL=$val ;;
+            peer:PublicKey) PUB=$val ;;
+            peer:PresharedKey) PSK=$val ;;
+            peer:Endpoint) EP=$val ;;
+            peer:PersistentKeepalive) KEEP=$val ;;
+            peer:AllowedIPs) ALLOWED=$val ;;
+        esac
+    done < "$1"
+    [ -n "$PK" ] && [ -n "$PUB" ] && [ -n "$EP" ] || { err "$1 missing keys"; exit 1; }
+    DNSVAL=${DNSVAL:-$DNS_DEFAULT}
+}
+
+cmd_validate() {  # $1 = profile name or path; parse-only check, no network changes
+    local conf
+    conf=$(resolve_profile "${1:-}") || exit 1
+    parse_profile "$conf"
+    echo "OK: $conf (endpoint $EP, address $ADDR, dns $DNSVAL)"
+}
+
+cmd_list() {  # one line per profile, tab-separated, no secrets:
+              # name<TAB>endpoint|INVALID<TAB>address<TAB>dns<TAB>active(1|0)
+    local file active meta ep ad dn flag
+    active=
+    if [ -f "$ACTIVE_FILE" ]; then
+        active=$(basename "$(cat "$ACTIVE_FILE" 2>/dev/null)")
+    fi
+    for file in "$PROFILES_DIR"/*.conf; do
+        [ -e "$file" ] || continue
+        # parse in a subshell so a broken profile cannot abort the listing
+        meta=$(parse_profile "$file" 2>/dev/null && {
+            echo "$EP"
+            echo "${ADDR%%,*}"
+            echo "$DNSVAL"
+        })
+        if [ -n "$meta" ]; then
+            ep=$(printf '%s\n' "$meta" | sed -n '1p')
+            ad=$(printf '%s\n' "$meta" | sed -n '2p')
+            dn=$(printf '%s\n' "$meta" | sed -n '3p')
+        else
+            ep=INVALID
+            ad='-'
+            dn='-'
+        fi
+        if [ "${file##*/}" = "$active" ]; then
+            flag=1
+        else
+            flag=0
+        fi
+        printf '%s\t%s\t%s\t%s\t%s\n' "${file##*/}" "$ep" "$ad" "$dn" "$flag"
+    done
+}
+
+cmd_latency() {  # $1 = profile name/path; echoes latency=<ms>|- (ICMP, best effort)
+    local conf host out t
+    conf=$(resolve_profile "${1:-}") || exit 1
+    parse_profile "$conf"
+    host=${EP%:*}
+    [ "$host" = "$EP" ] && { echo "latency=-"; return 0; }
+    out=$(ping -c 1 -W 2 "$host" 2>/dev/null)
+    t=$(printf '%s' "$out" | sed -n 's/.*time=\([0-9.]*\).*/\1/p' | head -1)
+    [ -n "$t" ] && echo "latency=$t" || echo "latency=-"
+}
+
+apply_profile() {  # uses parsed vars, $CONF
+    host=${EP%:*}; port=${EP##*:}
+    [ "$host" = "$EP" ] && port=51820
+    uci set network.$IFACE='interface'
+    uci set network.$IFACE.proto='wireguard'
+    uci set network.$IFACE.auto='0'
+    uci set network.$IFACE.private_key="$PK"
+    uci set network.$IFACE.addresses="$ADDR"
+    uci -q delete network.$PEER
+    uci set network.$PEER="wireguard_$IFACE"
+    uci set network.$PEER.public_key="$PUB"
+    uci -q delete network.$PEER.preshared_key
+    [ -n "$PSK" ] && uci set network.$PEER.preshared_key="$PSK"
+    uci set network.$PEER.endpoint_host="$host"
+    uci set network.$PEER.endpoint_port="$port"
+    uci set network.$PEER.persistent_keepalive="${KEEP:-25}"
+    uci set network.$PEER.description="$(basename "$CONF")"
+    uci -q delete network.$PEER.allowed_ips
+    if [ -n "$ALLOWED" ]; then
+        for aip in $(printf '%s' "$ALLOWED" | tr ',' ' '); do
+            case "$aip" in
+                *:*) continue ;;  # no IPv6 on the tunnel; v6 is dropped while ON
+            esac
+            uci add_list network.$PEER.allowed_ips="$aip"
+        done
+    fi
+    # ensure at least a default v4 route exists even if the profile was v6-only
+    uci -q get network.$PEER.allowed_ips >/dev/null 2>&1 || \
+        uci add_list network.$PEER.allowed_ips='0.0.0.0/0'
+    uci commit network || { err "apply_profile: uci commit network failed"; return 1; }
+}
+
+# --- kill switch / IPv6 leak protection (nftables) -------------------------
+nft_clear() {
+    command -v nft >/dev/null 2>&1 || return 0
+    nft delete table inet "$NFT_TABLE" 2>/dev/null
+}
+nft_apply() {
+    nft_clear
+    [ "$KILLSWITCH" = 1 ] || [ "$BLOCK_IPV6" = 1 ] || return 0
+    command -v nft >/dev/null 2>&1 || { err "nft not available"; return 1; }
+    nft add table inet "$NFT_TABLE" || return 1
+    nft add chain inet "$NFT_TABLE" forward \
+        '{ type filter hook forward priority 20; policy accept; }' || return 1
+    if [ "$KILLSWITCH" = 1 ]; then
+        # LAN clients may only egress via the tunnel or stay on the LAN
+        nft add rule inet "$NFT_TABLE" forward iifname "$LAN_DEV" \
+            oifname != "{ $IFACE, $LAN_DEV }" counter drop || return 1
+    fi
+    if [ "$BLOCK_IPV6" = 1 ]; then
+        # tunnel is IPv4-only: never let LAN v6 leak out the WAN
+        nft add rule inet "$NFT_TABLE" forward iifname "$LAN_DEV" \
+            meta nfproto ipv6 counter drop || return 1
+    fi
+    return 0
+}
+
+route_on() {
+    ip route flush table "$TABLE" 2>/dev/null
+    ip route add default dev "$IFACE" table "$TABLE" 2>/dev/null || \
+        ip route replace default dev "$IFACE" table "$TABLE"
+    rip=$(ip -4 addr show dev "$LAN_DEV" 2>/dev/null | awk '/inet /{print $2; exit}' | cut -d/ -f1)
+    [ -n "$rip" ] || rip=${LAN_NET%.*}.1
+    ip rule del pref "$PREF" 2>/dev/null
+    ip rule del pref $((PREF-1)) 2>/dev/null
+    # router-IP exclusion: replies from the router itself to LAN clients
+    # (SSH/LuCI/dnsmasq) must stay on the main table, not enter the tunnel
+    ip rule add pref $((PREF-1)) from "$rip" lookup 254
+    ip rule add pref "$PREF" from "$LAN_NET" lookup "$TABLE"
+    ip route replace "$DNSVAL"/32 dev "$IFACE"
+    printf '%s\n' "$DNSVAL" > "$DNS_MARKER"
+    ip rule show | grep -q "lookup $TABLE" || { err "route_on: policy rule missing after add"; return 1; }
+    return 0
+}
+
+route_off() {
+    ip rule del pref "$PREF" 2>/dev/null
+    ip rule del pref $((PREF-1)) 2>/dev/null
+    ip route flush table "$TABLE" 2>/dev/null
+    if [ -f "$DNS_MARKER" ]; then
+        ip route del "$(cat "$DNS_MARKER")"/32 dev "$IFACE" 2>/dev/null
+        rm -f "$DNS_MARKER"
+    fi
+    nft_clear
+}
+
+# --- DNS: preserve and restore the user's original dnsmasq upstreams -------
+dns_backup() {
+    mkdir -p "$PERSIST_DIR" 2>/dev/null
+    chmod 700 "$PERSIST_DIR" 2>/dev/null
+    [ -f "$DNS_BAK" ] && return 0
+    {
+        printf 'SERVERS=%s\n' "$(uci -q get dhcp.@dnsmasq[0].server)"
+        printf 'NORESOLV=%s\n' "$(uci -q get dhcp.@dnsmasq[0].noresolv)"
+    } > "$DNS_BAK" 2>/dev/null
+    chmod 600 "$DNS_BAK" 2>/dev/null
+}
+dns_on() {
+    [ -n "$DNSVAL" ] || { err "dns_on: no DNS server value"; return 1; }
+    dns_backup
+    # dnsmasq init only emits `list server` entries; a scalar option is ignored
+    uci -q delete dhcp.@dnsmasq[0].server
+    uci add_list dhcp.@dnsmasq[0].server="$DNSVAL"
+    uci set dhcp.@dnsmasq[0].noresolv='1'
+    uci commit dhcp || { err "dns_on: uci commit dhcp failed"; return 1; }
+    /etc/init.d/dnsmasq restart >/dev/null 2>&1
+    sleep 1
+    if ! grep -hs "^server=$DNSVAL" /tmp/etc/dnsmasq.conf.* >/dev/null 2>&1; then
+        err "dns_on: generated dnsmasq config lacks server=$DNSVAL"
+        err "  (uci has: $(uci -q get dhcp.@dnsmasq[0].server))"
+        return 1
+    fi
+    return 0
+}
+dns_off() {
+    [ -f "$DNS_BAK" ] || return 0
+    local servers noresolv s
+    servers=$(sed -n 's/^SERVERS=//p' "$DNS_BAK" | head -1)
+    noresolv=$(sed -n 's/^NORESOLV=//p' "$DNS_BAK" | head -1)
+    uci -q delete dhcp.@dnsmasq[0].server
+    for s in $servers; do
+        uci add_list dhcp.@dnsmasq[0].server="$s"
+    done
+    if [ -n "$noresolv" ]; then
+        uci set dhcp.@dnsmasq[0].noresolv="$noresolv"
+    else
+        uci -q delete dhcp.@dnsmasq[0].noresolv
+    fi
+    uci commit dhcp
+    rm -f "$DNS_BAK"
+    /etc/init.d/dnsmasq restart >/dev/null 2>&1
+}
+
+rollback_quiet() {
+    route_off
+    ifdown "$IFACE" 2>/dev/null
+    dns_off
+    rm -f "$ACTIVE_FILE"
+}
+
+verify_data_path() {
+    local t0 t1
+    ping -c 1 -W 3 "$DNSVAL" >/dev/null 2>&1 && return 0
+    t0=$(wg show "$IFACE" transfer 2>/dev/null | awk 'NR==1{print $2+$3}')
+    sleep 2
+    t1=$(wg show "$IFACE" transfer 2>/dev/null | awk 'NR==1{print $2+$3}')
+    if [ -n "$t0" ] && [ -n "$t1" ] && [ "$t1" -gt "$t0" ]; then
+        return 0
+    fi
+    return 1
+}
+
+bring_up() {  # $1 = conf file; staged bring-up with self-verification + rollback
+    CONF=$1
+    parse_profile "$CONF"
+    apply_profile || { err "failed to write interface config"; exit 1; }
+    ifup "$IFACE" 2>/dev/null
+    i=0
+    while ! ip link show dev "$IFACE" >/dev/null 2>&1 && [ $i -lt 10 ]; do
+        sleep 1; i=$((i+1))
+    done
+    if ! ip link show dev "$IFACE" >/dev/null 2>&1; then
+        err "$IFACE did not come up"
+        exit 1
+    fi
+    # Stage 1: give the tunnel a route to the tunnel DNS and force a handshake.
+    # LAN routing and DNS are NOT touched yet, so a failure cannot break the LAN.
+    ip route replace "$DNSVAL"/32 dev "$IFACE" 2>/dev/null
+    printf '%s\n' "$DNSVAL" > "$DNS_MARKER"
+    ping -c 1 -W 2 "$DNSVAL" >/dev/null 2>&1
+    i=0
+    while [ $i -lt 30 ]; do
+        ts=$(wg show "$IFACE" latest-handshakes 2>/dev/null | awk 'NR==1{print $2}')
+        now=$(date +%s)
+        if [ -n "$ts" ] && [ "$ts" -gt 0 ] && [ $((now - ts)) -lt 90 ]; then
+            break
+        fi
+        sleep 2; i=$((i+2))
+    done
+    ts=$(wg show "$IFACE" latest-handshakes 2>/dev/null | awk 'NR==1{print $2}')
+    now=$(date +%s)
+    if [ -z "$ts" ] || [ "$ts" -le 0 ] || [ $((now - ts)) -ge 90 ]; then
+        ep=$(wg show "$IFACE" endpoints 2>/dev/null | awk 'NR==1{print $2}')
+        rollback_quiet
+        err "no WireGuard handshake with $ep after ~30s."
+        echo "Rolled back: LAN internet untouched, tunnel down." >&2
+        exit 1
+    fi
+    # Stage 2: handshake OK, now switch LAN routing + DNS over the tunnel.
+    if ! route_on; then
+        rollback_quiet
+        err "policy routing setup failed. Rolled back: LAN on direct internet."
+        exit 1
+    fi
+    if ! verify_data_path; then
+        rollback_quiet
+        err "handshake OK but no data path (ping $DNSVAL failed). Rolled back."
+        exit 1
+    fi
+    if ! dns_on; then
+        rollback_quiet
+        err "DNS switchover failed. Rolled back: LAN on direct internet."
+        exit 1
+    fi
+    if ! nft_apply; then
+        rollback_quiet
+        err "leak-protection rules failed. Rolled back: LAN on direct internet."
+        exit 1
+    fi
+    echo "$CONF" > "$ACTIVE_FILE"
+    cmd_status
+}
+
+cmd_on() {  # selection honors mode: pinned = always that profile, else random
+    local conf
+    if [ "$MODE" = pinned ]; then
+        if [ -z "$PINNED" ]; then
+            err "mode is pinned but no profile is set (vpn-toggle pin <profile>)"
+            exit 1
+        fi
+        case "$PINNED" in
+            *[!A-Za-z0-9._-]*|.*|*..*)
+                err "invalid pinned profile name: $PINNED"
+                exit 1 ;;
+        esac
+        conf="$PROFILES_DIR/$PINNED"
+        if [ ! -f "$conf" ]; then
+            err "pinned profile not found: $conf"
+            echo "  (remove the profile, or run: vpn-toggle unpin)" >&2
+            exit 1
+        fi
+    else
+        conf=$(pick_profile) || exit 1
+    fi
+    bring_up "$conf"
+}
+
+cmd_pick() {  # $1 = profile name or path; one-off activation (not persisted)
+    local conf
+    conf=$(resolve_profile "${1:-}") || exit 1
+    bring_up "$conf"
+}
+
+cmd_switch() {  # reconnect: pinned -> same pinned profile, random -> a different one
+    local prev conf
+    if [ -f "$ACTIVE_FILE" ]; then
+        prev=$(cat "$ACTIVE_FILE" 2>/dev/null)
+    fi
+    cmd_off >/dev/null 2>&1
+    if [ "$MODE" = pinned ]; then
+        cmd_on
+        return
+    fi
+    conf=$(pick_profile "${prev##*/}") || exit 1
+    bring_up "$conf"
+}
+
+cmd_off() {
+    route_off
+    ifdown "$IFACE" 2>/dev/null
+    dns_off
+    rm -f "$ACTIVE_FILE"
+    cmd_status
+}
+
+cmd_reset() {  # boot-time safety: clean any leftovers from a crash while ON
+    route_off
+    ifdown "$IFACE" 2>/dev/null
+    dns_off
+    rm -f "$ACTIVE_FILE"
+}
+
+cmd_status() {
+    local n
+    n=$(ls "$PROFILES_DIR"/*.conf 2>/dev/null | wc -l)
+    if [ -f "$ACTIVE_FILE" ]; then
+        echo "State: ON  (profile: $(basename "$(cat "$ACTIVE_FILE")"), $n profiles available)"
+        wg show "$IFACE" 2>/dev/null | grep -E 'interface|public key|listening|peer|endpoint|allowed ips|latest handshake|transfer' || echo "(wg show: no output)"
+        if ip rule show | grep -q "lookup $TABLE"; then
+            echo "policy rule (LAN -> table $TABLE): present"
+        else
+            echo "policy rule: MISSING"
+        fi
+        if [ "$KILLSWITCH" = 1 ]; then
+            echo "kill switch: ENABLED"
+        else
+            echo "kill switch: disabled"
+        fi
+        if [ "$BLOCK_IPV6" = 1 ]; then
+            echo "IPv6 leak protection: ENABLED"
+        else
+            echo "IPv6 leak protection: disabled"
+        fi
+    else
+        echo "State: OFF ($n profiles available)"
+        ip link show dev "$IFACE" >/dev/null 2>&1 && echo "warning: $IFACE is up without active marker"
+    fi
+    if [ "$MODE" = pinned ]; then
+        if [ -n "$PINNED" ]; then
+            echo "Mode: pinned (profile: $PINNED)"
+        else
+            echo "Mode: pinned (WARNING: no profile pinned)"
+        fi
+    else
+        echo "Mode: random"
+    fi
+}
+
+cmd_info() {  # machine-readable key=value state for the LuCI dashboard
+    local active hs now age ep rx tx xfer rule
+    active=''
+    [ -f "$ACTIVE_FILE" ] && active=$(basename "$(cat "$ACTIVE_FILE" 2>/dev/null)")
+    if [ -n "$active" ]; then
+        echo "state=ON"
+        echo "profile=$active"
+    else
+        echo "state=OFF"
+        echo "profile="
+    fi
+    ep=$(wg show "$IFACE" endpoints 2>/dev/null | awk 'NR==1{print $2}')
+    hs=$(wg show "$IFACE" latest-handshakes 2>/dev/null | awk 'NR==1{print $2}')
+    now=$(date +%s)
+    if [ -n "$hs" ] && [ "$hs" -gt 0 ]; then
+        age=$((now - hs))
+    else
+        age=-1
+    fi
+    xfer=$(wg show "$IFACE" transfer 2>/dev/null | awk 'NR==1{print $2" "$3}')
+    rx=$(printf '%s' "$xfer" | awk '{print $1}')
+    tx=$(printf '%s' "$xfer" | awk '{print $2}')
+    rule=missing
+    ip rule show | grep -q "lookup $TABLE" && rule=present
+    echo "endpoint=${ep:-}"
+    echo "handshake=${age}"
+    echo "rx=${rx:-0}"
+    echo "tx=${tx:-0}"
+    echo "rule=$rule"
+    echo "mode=$MODE"
+    echo "pinned=${PINNED:-}"
+    echo "killswitch=$KILLSWITCH"
+    echo "block_ipv6=$BLOCK_IPV6"
+}
+
+cmd_pin() {  # $1 = profile name; persist it as the always-used profile
+    local conf
+    conf=$(resolve_profile "${1:-}") || exit 1
+    uci set vpntoggle.main.pinned="${conf##*/}"
+    uci set vpntoggle.main.mode='pinned'
+    uci commit vpntoggle
+    echo "pinned: ${conf##*/} (mode=pinned; 'vpn-toggle on' will always use it)"
+}
+
+cmd_unpin() {  # back to random selection
+    uci -q delete vpntoggle.main.pinned
+    uci set vpntoggle.main.mode='random'
+    uci commit vpntoggle
+    echo "unpinned: mode=random ('vpn-toggle on' picks a random profile)"
+}
+
+cmd_set() {  # $1=key $2=value; persist a setting and re-apply leak rules if ON
+    local key="${1:-}" val="${2:-}"
+    case "$key" in
+        killswitch)
+            case "$val" in 0|1) KILLSWITCH=$val ;;
+                *) err "killswitch must be 0 or 1"; exit 1 ;; esac
+            uci set vpntoggle.main.killswitch="$val" ;;
+        block_ipv6)
+            case "$val" in 0|1) BLOCK_IPV6=$val ;;
+                *) err "block_ipv6 must be 0 or 1"; exit 1 ;; esac
+            uci set vpntoggle.main.block_ipv6="$val" ;;
+        mode)
+            case "$val" in random|pinned) MODE=$val ;;
+                *) err "mode must be random or pinned"; exit 1 ;; esac
+            uci set vpntoggle.main.mode="$val" ;;
+        *)
+            err "unknown setting: $key"
+            exit 1 ;;
+    esac
+    uci commit vpntoggle
+    if [ -f "$ACTIVE_FILE" ]; then
+        if ! nft_apply; then
+            err "applied setting but failed to refresh leak-protection rules"
+            exit 1
+        fi
+    fi
+    echo "set $key=$val"
+}
+
+cmd_fetch() {  # $1=name $2=url; download a wg config, validate, install
+    local name url tmp
+    name=$(sanitize_name "${1:-}")
+    url="${2:-}"
+    [ -n "$name" ] || { err "fetch: no profile name given"; exit 1; }
+    case "$url" in
+        http://*|https://*) ;;
+        *) err "fetch: only http/https URLs are allowed"; exit 1 ;;
+    esac
+    mkdir -p "$STATE_DIR" "$PROFILES_DIR"
+    tmp="$STATE_DIR/fetch.$$"
+    if command -v uclient-fetch >/dev/null 2>&1; then
+        uclient-fetch -q -O "$tmp" "$url" || :
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -O "$tmp" "$url" || :
+    else
+        err "fetch: no downloader (uclient-fetch/wget) available"
+        exit 1
+    fi
+    if [ ! -s "$tmp" ]; then
+        rm -f "$tmp"
+        err "fetch: download failed"
+        exit 1
+    fi
+    if ! grep -q '\[Interface\]' "$tmp" || ! grep -q '\[Peer\]' "$tmp"; then
+        rm -f "$tmp"
+        err "fetch: downloaded file is not a WireGuard config"
+        exit 1
+    fi
+    cp "$tmp" "$PROFILES_DIR/$name.conf"
+    chmod 600 "$PROFILES_DIR/$name.conf"
+    rm -f "$tmp"
+    if ! cmd_validate "$name" >/dev/null 2>&1; then
+        rm -f "$PROFILES_DIR/$name.conf"
+        err "fetch: downloaded profile failed validation"
+        exit 1
+    fi
+    echo "imported: $name.conf"
+}
+
+cmd_setup() {
+    mkdir -p "$PROFILES_DIR"
+    chmod 700 "$PROFILES_DIR" 2>/dev/null
+    chmod 600 "$PROFILES_DIR"/*.conf 2>/dev/null
+    if ! uci -q get firewall.vpn >/dev/null 2>&1; then
+        uci set firewall.vpn='zone'
+        uci set firewall.vpn.name='vpn'
+        uci add_list firewall.vpn.network="$IFACE"
+        uci set firewall.vpn.input='REJECT'
+        uci set firewall.vpn.output='ACCEPT'
+        uci set firewall.vpn.forward='REJECT'
+        uci set firewall.vpn.masq='1'
+        uci set firewall.vpn.mtu_fix='1'
+        uci set firewall.lan_vpn='forwarding'
+        uci set firewall.lan_vpn.src='lan'
+        uci set firewall.lan_vpn.dest='vpn'
+        uci commit firewall
+        /etc/init.d/firewall reload
+        echo "firewall zone 'vpn' created"
+    else
+        echo "firewall zone 'vpn' already present"
+    fi
+    if [ -x /etc/init.d/vpntoggle ]; then
+        /etc/init.d/vpntoggle enable 2>/dev/null
+        echo "boot-reset hook enabled (init.d vpntoggle)"
+    elif grep -q 'vpn-toggle reset' /etc/rc.local 2>/dev/null; then
+        echo "rc.local hook already present"
+    elif [ -f /etc/rc.local ]; then
+        sed -i '/^exit 0/i [ -x /usr/sbin/vpn-toggle ] \&\& /usr/sbin/vpn-toggle reset >/dev/null 2>\&1' /etc/rc.local
+        echo "rc.local boot-reset hook added"
+    else
+        printf '#!/bin/sh\n[ -x /usr/sbin/vpn-toggle ] \&\& /usr/sbin/vpn-toggle reset >/dev/null 2>\&1\nexit 0\n' > /etc/rc.local
+        chmod +x /etc/rc.local
+        echo "rc.local created with boot-reset hook"
+    fi
+    echo "setup done. profiles: $(ls "$PROFILES_DIR"/*.conf 2>/dev/null | wc -l)"
+}
+
+# --- dispatch --------------------------------------------------------------
+case "${1:-status}" in
+    on|off|switch|pick|pin|unpin|set|fetch|reset|setup) acquire_lock ;;
+esac
+
+case "${1:-status}" in
+    on) cmd_on ;;
+    off) cmd_off ;;
+    switch) cmd_switch ;;
+    status) cmd_status ;;
+    info) cmd_info ;;
+    list) cmd_list ;;
+    latency) cmd_latency "$2" ;;
+    pin) cmd_pin "$2" ;;
+    unpin) cmd_unpin ;;
+    pick) cmd_pick "$2" ;;
+    validate) cmd_validate "$2" ;;
+    set) cmd_set "$2" "$3" ;;
+    fetch) cmd_fetch "$2" "$3" ;;
+    setup) cmd_setup ;;
+    reset) cmd_reset ;;
+    *) echo "usage: $0 {on|off|switch|status|info|setup|reset|list|latency|pin|unpin|pick|validate|set|fetch}" >&2; exit 1 ;;
+esac
